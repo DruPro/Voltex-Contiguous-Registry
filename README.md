@@ -78,7 +78,8 @@ offsets_vec -= (hole_size_vec * mask);
 
 ---
 
-## Quick Start: The Stackless FSM
+
+## Implementation Examples: The Stackless FSM
 
 VCR is perfect for building high-speed state machines. Because the core is contiguous, your "Program Counter" is simply a key in the registry.
 
@@ -101,9 +102,103 @@ var current_state: []const u8 = "init";
 while (!std.mem.eql(u8, current_state, "end")) {
     const func = try myCore.getField(current_state, StateFn);
     current_state = func(&myCore, allocator);
-}
 
+}
 ```
+## Lazy JSON → VCR Tape Implementation
+
+This section describes a **lazy JSON-to-VCR bridge**, where raw JSON is converted into a compact, tape-like runtime representation (VCR) that supports **typed, on-demand field access** without eagerly materializing a full struct.
+
+The goal is to:
+
+* Parse JSON once
+* Store values in a generic, indexed “tape”
+* Decode values only when a field is requested
+* Avoid schema generation or rigid structs
+
+### Concept
+
+* **JSON** is treated as an input serialization format.
+* **VCR Tape** is a lightweight, type-tagged storage of values.
+* Fields are accessed lazily via `getField(name, Type)`.
+
+This approach is ideal for:
+
+* ECS-style entity loading
+* Modding / data-driven gameplay
+* Debug tooling
+* Rapid iteration without recompilation
+
+---
+
+### Flow Overview
+
+1. Parse raw JSON text.
+2. Convert JSON key-value pairs into a VCR tape.
+3. Store minimal metadata (field name hash, type tag, value offset).
+4. Decode values only when accessed via a typed getter.
+
+---
+
+### Example Usage (Zig)
+
+```zig
+var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+const allocator = gpa.allocator();
+defer _ = gpa.deinit();
+
+const raw_json =
+    \\{
+    \\  "name_hash": 12345,
+    \\  "hp": 100,
+    \\  "speed": 5.5,
+    \\  "is_boss": true
+    \\}
+;
+
+std.debug.print("--- Converting JSON to VCR Tape ---\n", .{});
+
+// Create the entity core via our bridge
+var entity_core = try jsonToVCR(allocator, raw_json);
+defer entity_core.deinit(allocator);
+
+// Access the fields using the built-in getter
+const hp = try entity_core.getField("hp", i32);
+const speed = try entity_core.getField("speed", f32);
+const is_boss = try entity_core.getField("is_boss", bool);
+
+std.debug.print("Entity HP: {d}\n", .{hp});
+std.debug.print("Entity Speed: {d:.1}\n", .{speed});
+std.debug.print("Is Boss: {}\n", .{is_boss});
+```
+
+---
+
+### Key Properties
+
+* **Lazy decoding**
+  Values are parsed from the tape only when requested.
+
+* **Type-safe access**
+  `getField("hp", i32)` enforces runtime type validation.
+
+* **Allocator-aware**
+  All memory is owned and explicitly deinitialized.
+
+* **Schema-free**
+  No structs or reflection required.
+
+---
+
+### Why “VCR”?
+
+Much like a video cassette:
+
+* Data is recorded once
+* Played back repeatedly
+* Fast-forwarded (field lookup)
+* Decoded only when viewed
+
 
 
 ---
