@@ -147,13 +147,13 @@ pub const DynamicCore = struct {
         var target_type_hash: TypeID = undefined;
         try hashHelpers.gen_hash(@typeName(T), &target_type_hash);
 
-        if (!std.mem.eql(u8, &self.fields.typeIDs.items[idx], &target_type_hash)) {
+        if (!std.mem.eql(u8, &self.metaData.typeID.items[idx], &target_type_hash)) {
             return error.TypeMismatch;
         }
 
         // 2. Direct Indexing (Fast!)
-        const offset = self.fields.offsets.items[idx];
-        const length = self.fields.lengths.items[idx];
+        const offset = self.metaData.offset.items[idx];
+        const length = self.metaData.length.items[idx];
 
         const bytes = self.memory.items[offset..][0..length];
         return std.mem.bytesToValue(T, bytes[0..@sizeOf(T)]);
@@ -221,6 +221,45 @@ pub const DynamicCore = struct {
         _ = self.metaData.names.swapRemove(idx);
     }
 };
+
+/// A factory function to transform a JSON string into a high-performance VCR Core.
+pub fn jsonToVCR(allocator: std.mem.Allocator, json_input: []const u8) !DynamicCore {
+    // 1. Initialize the core using its built-in method
+    var core = try DynamicCore.init("root", allocator);
+    errdefer core.deinit(allocator);
+
+    // 2. Parse the JSON using modern Zig std.json
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        json_input,
+        .{},
+    );
+    defer parsed.deinit();
+
+    // 3. Ensure we have a JSON object to iterate
+    const root_obj = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.JsonRootMustBeObject,
+    };
+
+    // 4. Populate the VCR using core.setField()
+    var it = root_obj.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const val = entry.value_ptr.*;
+
+        switch (val) {
+            .integer => |v| try core.setField(key, @as(i32, @intCast(v)), allocator),
+            .float => |v| try core.setField(key, @as(f32, @floatCast(v)), allocator),
+            .string => |v| try core.setField(key, v, allocator),
+            .bool => |v| try core.setField(key, v, allocator),
+            else => continue, // Skip complex nested types for this flat bridge
+        }
+    }
+
+    return core;
+}
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
