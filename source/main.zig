@@ -3,134 +3,67 @@ const hashHelpers = @import("./hash_helpers.zig");
 const builtin = @import("builtin");
 const hashStringLen = std.crypto.hash.Blake3.digest_length;
 const CoreID = [hashStringLen]u8;
+const TypeID = [hashStringLen]u8;
+const FieldNameHash: type = u64;
 const ByteTranform: type = []u8;
 const FieldFetchErr = error{ invalidField, invalidType };
 
-pub const DynamicCore = struct {
-    CoreName: []const u8,
-    memory: std.ArrayList(u8),
-    fields: std.StringArrayHashMap(CoreField),
+const CoreFieldMeta = struct {
+    offset: std.ArrayList(usize),
+    length: std.ArrayList(usize),
+    typeID: std.ArrayList(TypeID),
+    name_hashes: std.ArrayList(u64), // Used for SIMD matching
+    names: std.ArrayList([]const u8), // Used for debugging/edge cases
 
-    pub fn init(name: []const u8, allocator: std.mem.Allocator) !DynamicCore {
-        return DynamicCore{
-            .CoreName = name,
-            .memory = try std.ArrayList(u8).initCapacity(allocator, 0),
-            .fields = std.StringArrayHashMap(CoreField).init(allocator),
+    fn init(allocator: std.mem.Allocator) !CoreFieldMeta {
+        return CoreFieldMeta{
+            .offset = try std.ArrayList(usize).initCapacity(allocator, 0),
+            .length = try std.ArrayList(usize).initCapacity(allocator, 0),
+            .typeID = try std.ArrayList(TypeID).initCapacity(allocator, 0),
+            .name_hashes = try std.ArrayList(u64).initCapacity(allocator, 0),
+            .names = try std.ArrayList([]const u8).initCapacity(allocator, 0),
         };
     }
 
-    pub fn deinit(self: *DynamicCore, allocator: std.mem.Allocator) void {
-        self.memory.deinit(allocator);
-        self.fields.deinit();
+    fn deinit(self: *CoreFieldMeta, allocator: std.mem.Allocator) void {
+        self.offset.deinit(allocator);
+        self.length.deinit(allocator);
+        self.typeID.deinit(allocator);
+        self.name_hashes.deinit(allocator);
+        self.names.deinit(allocator);
     }
 
-    /// Appends a new value to the end of the memory buffer.
-    pub fn setField(self: *DynamicCore, field_name: []const u8, value: anytype, allocator: std.mem.Allocator) !void {
-        // 1. Prepare the new data
-        const byteTransform = std.mem.toBytes(value);
-        const valTypeID = @typeName(@TypeOf(value));
-        // 2. Check if the field already exists
-        if (self.fields.getPtr(field_name)) |existing_field| {
-            // --- THE GOLDEN PATH: In-Place Update ---
-            if (existing_field.length == byteTransform.len) {
-                const start = existing_field.offset;
-                const end = start + existing_field.length;
-                @memcpy(self.memory.items[start..end], &byteTransform);
-                existing_field.typeID = valTypeID; // Update type if needed
-                return;
-            }
-
-            // If size changed, we have to do the expensive move
-            self.removeField(field_name);
-        }
-
-        const byteLen: usize = byteTransform.len;
-        const byteOffset: usize = self.memory.items.len;
-
-        // 3. Append to the end of the memory buffer
-        try self.memory.appendSlice(allocator, &byteTransform);
-
-        // 4. Register the new metadata
-        const coreField: CoreField = CoreField{
-            .offset = byteOffset,
-            .length = byteLen,
-            .typeID = valTypeID,
-        };
-
-        try self.fields.put(field_name, coreField);
-    }
-
-    /// Reconstructs the type from the byte buffer
-    pub fn getField(
-        self: *const DynamicCore,
-        field_name: []const u8,
-        comptime T: type, // Pass the type itself, not an instance
-    ) !T {
-        // 1. Get the field metadata (returns an Optional)
-        // We use 'if' to check if the field exists and unwrap it in one go
-        const field = self.fields.get(field_name) orelse {
-            return error.invalidField;
-        };
-        if (!std.mem.eql(u8, field.typeID, @typeName(T))) {
-            return error.invalidType;
-        }
-        const start = field.offset;
-        const end = field.offset + field.length;
-        const bytes = self.memory.items[start..end];
-        return std.mem.bytesToValue(T, bytes[0..@sizeOf(T)]);
-    }
-
-    pub fn relocateOffsetsSIMD(self: *DynamicCore, hole_start: usize, hole_size: usize) void {
-        const Vector = @Vector(8, usize);
-        const start_v: Vector = @splat(hole_start);
-        const size_v: Vector = @splat(hole_size);
-
+    pub fn findFieldIndex(self: *const CoreFieldMeta, name: []const u8) ?usize {
+        const target_hash: FieldNameHash = std.hash.Wyhash.hash(0, name); // Fast 64-bit hash
+        const hashes = self.name_hashes.items;
         var i: usize = 0;
-        const entries = self.fields.values(); // Get the slice of CoreField metadata
 
-        // 1. Process offsets in chunks of 8
-        while (i + 8 <= entries.len) : (i += 8) {
-            // Load offsets into a vector
-            var offsets: Vector = .{
-                entries[i + 0].offset, entries[i + 1].offset,
-                entries[i + 2].offset, entries[i + 3].offset,
-                entries[i + 4].offset, entries[i + 5].offset,
-                entries[i + 6].offset, entries[i + 7].offset,
-            };
+        // Process in chunks of 4 (using 256-bit SIMD for u64)
+        const VecSize = 4;
+        const Vec = @Vector(VecSize, u64);
 
-            // The Boolean Comparison: [CurrentOffset > HoleStart]
-            // This creates a mask of 1s (true) and 0s (false)
-            const mask = @intFromBool(offsets > start_v);
+        while (i + VecSize <= hashes.len) : (i += VecSize) {
+            const chunk: Vec = hashes[i..][0..VecSize].*;
+            const target_vec: Vec = @splat(target_hash);
 
-            // Apply the equation: NewOffset = CurrentOffset - (HoleSize * Mask)
-            offsets -= (size_v * mask);
+            // Compare target against 4 hashes at once
+            const match_mask = chunk == target_vec;
 
-            // Store them back into the metadata
-            inline for (0..8) |j| {
-                entries[i + j].offset = offsets[j];
+            // If any bit in the mask is true, we found it
+            if (@reduce(.Or, match_mask)) {
+                // Find which specific lane matched (0, 1, 2, or 3)
+                inline for (0..VecSize) |lane| {
+                    if (match_mask[lane]) return i + lane;
+                }
             }
         }
 
-        // 2. Handle the remaining entries (the "tail") that didn't fit in a chunk of 8
-        while (i < entries.len) : (i += 1) {
-            const should_shift = @intFromBool(entries[i].offset > hole_start);
-            entries[i].offset -= (hole_size * should_shift);
+        // Scalar tail for remaining items
+        while (i < hashes.len) : (i += 1) {
+            if (hashes[i] == target_hash) return i;
         }
-    }
-    /// Removes a field and shifts all memory/offsets to fill the gap
-    pub fn removeField(self: *DynamicCore, field_name: []const u8) void {
-        const meta = self.fields.get(field_name) orelse return;
 
-        // 1. Physically shift the bytes in the buffer
-        const bytes_after = self.memory.items[meta.offset + meta.length ..];
-        std.mem.copyForwards(u8, self.memory.items[meta.offset..], bytes_after);
-        self.memory.items.len -= meta.length;
-
-        // 2. Mathematically relocate all other offsets using SIMD
-        self.relocateOffsetsSIMD(meta.offset, meta.length);
-
-        // 3. Remove the metadata entry
-        _ = self.fields.swapRemove(field_name);
+        return null;
     }
 };
 
@@ -138,6 +71,155 @@ const CoreField = struct {
     offset: usize,
     length: usize,
     typeID: []const u8,
+};
+
+pub const DynamicCore = struct {
+    CoreName: []const u8,
+    memory: std.ArrayList(u8),
+    metaData: CoreFieldMeta,
+
+    pub fn init(name: []const u8, allocator: std.mem.Allocator) !DynamicCore {
+        return DynamicCore{
+            .CoreName = name,
+            .memory = try std.ArrayList(u8).initCapacity(allocator, 0),
+            .metaData = try CoreFieldMeta.init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *DynamicCore, allocator: std.mem.Allocator) void {
+        self.memory.deinit(allocator);
+        self.metaData.deinit(allocator);
+    }
+
+    pub fn setField(self: *DynamicCore, field_name: []const u8, value: anytype, allocator: std.mem.Allocator) !void {
+        // 1. Prepare the new data
+        const byteTransform = std.mem.toBytes(value);
+        var valTypeID: TypeID = undefined;
+        try hashHelpers.gen_hash(@typeName(@TypeOf(value)), &valTypeID);
+
+        // 2. Search for existing field index using SIMD-optimized scan
+        if (self.metaData.findFieldIndex(field_name)) |idx| {
+            // --- THE GOLDEN PATH: In-Place Update ---
+            // We can only update in-place if the byte length hasn't changed
+            if (self.metaData.length.items[idx] == byteTransform.len) {
+                const start = self.metaData.offset.items[idx];
+                const end = start + byteTransform.len;
+
+                // Overwrite memory directly
+                @memcpy(self.memory.items[start..end], &byteTransform);
+
+                // Update type ID in the metadata array
+                self.metaData.typeID.items[idx] = valTypeID;
+                return;
+            }
+
+            // If size changed, we must remove it (which triggers SIMD shift)
+            // and re-append at the end to maintain contiguity.
+            self.removeField(field_name);
+        }
+
+        // 3. New Field or Size-Changed Field: Append to the end of the tape
+        const byteLen: usize = byteTransform.len;
+        const byteOffset: usize = self.memory.items.len;
+
+        // Append raw data to the primary byte buffer
+        try self.memory.appendSlice(allocator, &byteTransform);
+
+        // 4. Update Metadata SoA (Parallel Push)
+        // Generate the name hash for future SIMD searches
+        const name_hash = std.hash.Wyhash.hash(0, field_name);
+
+        try self.metaData.offset.append(allocator, byteOffset);
+        try self.metaData.length.append(allocator, byteLen);
+        try self.metaData.typeID.append(allocator, valTypeID);
+        try self.metaData.name_hashes.append(allocator, name_hash);
+
+        // We store the string name for debugging or scenarios where hashing isn't enough
+        // Note: In a production VCR, you might want to duplicate the string to owned memory
+        try self.metaData.names.append(allocator, field_name);
+    }
+
+    /// Reconstructs the type from the byte buffer
+    pub fn getField(self: *const DynamicCore, field_name: []const u8, comptime T: type) !T {
+        const idx = self.metaData.findFieldIndex(field_name) orelse return error.FieldNotFound;
+
+        // 1. Verify Type (Safety First)
+        var target_type_hash: TypeID = undefined;
+        try hashHelpers.gen_hash(@typeName(T), &target_type_hash);
+
+        if (!std.mem.eql(u8, &self.fields.typeIDs.items[idx], &target_type_hash)) {
+            return error.TypeMismatch;
+        }
+
+        // 2. Direct Indexing (Fast!)
+        const offset = self.fields.offsets.items[idx];
+        const length = self.fields.lengths.items[idx];
+
+        const bytes = self.memory.items[offset..][0..length];
+        return std.mem.bytesToValue(T, bytes[0..@sizeOf(T)]);
+    }
+
+    pub fn relocateOffsetsSIMD(self: *DynamicCore, hole_start: usize, hole_size: usize) void {
+        // With SoA, offsets is just a slice of usize. No more struct jumping!
+        const offsets = self.metaData.offset.items;
+
+        const VecSize = 8;
+        const Vec = @Vector(VecSize, usize);
+        const start_v: Vec = @splat(hole_start);
+        const size_v: Vec = @splat(hole_size);
+
+        var i: usize = 0;
+
+        // 1. Process in blocks of 8
+        while (i + VecSize <= offsets.len) : (i += VecSize) {
+            // Load the block directly into a vector
+            var v: Vec = offsets[i..][0..VecSize].*;
+
+            // The Iverson Bracket Math:
+            // NewOffset = OldOffset - (HoleSize * [OldOffset > HoleStart])
+            const mask = @intFromBool(v > start_v);
+            v -= (size_v * mask);
+
+            // Write the block back to memory in one go
+            offsets[i..][0..VecSize].* = v;
+        }
+
+        // 2. Handle the tail (scalar fallback)
+        while (i < offsets.len) : (i += 1) {
+            // We use the same branchless logic even in the tail for consistency
+            const should_shift = @intFromBool(offsets[i] > hole_start);
+            offsets[i] -= (hole_size * should_shift);
+        }
+    }
+
+    /// Removes a field and shifts all memory/offsets to fill the gap
+    pub fn removeField(self: *DynamicCore, field_name: []const u8) void {
+        // 1. Find the index using our SIMD Search
+        const idx = self.metaData.findFieldIndex(field_name) orelse return;
+
+        // Capture the metadata before we start shifting things
+        const hole_offset = self.metaData.offset.items[idx];
+        const hole_length = self.metaData.length.items[idx];
+
+        // 2. Physically shift the bytes in the memory tape
+        // This fills the 'hole' in the raw byte buffer
+        const bytes_after = self.memory.items[hole_offset + hole_length ..];
+        std.mem.copyForwards(u8, self.memory.items[hole_offset..], bytes_after);
+        self.memory.items.len -= hole_length;
+
+        // 3. Mathematically relocate all offsets that pointed to data AFTER the hole
+        // Note: We do this BEFORE the swapRemove so the indices are still stable
+        self.relocateOffsetsSIMD(hole_offset, hole_length);
+
+        // 4. Synchronized swapRemove
+        // We remove the metadata at 'idx' by swapping the last element into its place.
+        // This must be done for EVERY array in the SoA to keep them in sync.
+        _ = self.metaData.offset.swapRemove(idx);
+        _ = self.metaData.length.swapRemove(idx);
+        _ = self.metaData.typeID.swapRemove(idx);
+        _ = self.metaData.name_hashes.swapRemove(idx);
+        _ = self.metaData.names.swapRemove(idx);
+    }
 };
 
 pub fn main() !void {
@@ -211,5 +293,67 @@ pub fn main() !void {
         }
         const elapsed = timer.read();
         std.debug.print("Voltex Tape (Bulk Blit):  {d:>12} ns\n", .{elapsed});
+    }
+    // --- Benchmark 3: Search Speed ---
+    // HashMap vs. VCR SIMD-SoA
+    {
+        const iterations: usize = 10_000;
+
+        // 1. Warehouse (HashMap) Search
+        {
+            var timer = try std.time.Timer.start();
+            for (0..iterations) |_| {
+                for (warehouse_actors) |*map| {
+                    _ = map.get("hp");
+                }
+            }
+            const elapsed = timer.read();
+            std.debug.print("HashMap Search (1M Lookups): {d:>12} ns\n", .{elapsed});
+        }
+
+        // 2. Voltex SIMD-SoA Search
+        {
+            var timer = try std.time.Timer.start();
+            for (0..iterations) |_| {
+                for (voltex_actors) |*core| {
+                    _ = core.metaData.findFieldIndex("hp");
+                }
+            }
+            const elapsed = timer.read();
+            std.debug.print("Voltex SIMD Search (1M Lookups): {d:>12} ns\n", .{elapsed});
+        }
+    }
+    // --- Benchmark 4: The Chaos Stress Test (SoA Edition) ---
+    // 10,000 frames of random mutations across 1,000 actors
+    // --- Benchmark 4: The Chaos Stress Test ---
+    {
+        var prng = std.Random.DefaultPrng.init(42); // Note the capital 'R' and .Random
+        const rand = prng.random();
+        var timer = try std.time.Timer.start();
+
+        for (0..10_000) |_| {
+            for (voltex_actors) |*core| {
+                const action = rand.uintLessThan(u8, 100);
+
+                if (action < 20) {
+                    // 20% Chance: Dynamic Removal
+                    core.removeField("speed_boost");
+                } else if (action < 50) {
+                    // 30% Chance: Dynamic Insertion
+                    const poison_val = rand.float(f32) * 10.0;
+                    try core.setField("poison_dot", poison_val, allocator);
+                } else {
+                    // 50% Chance: Golden Path (In-place)
+                    try core.setField("hp", @as(i32, 95), allocator);
+                }
+            }
+        }
+
+        const elapsed = timer.read();
+        const total_ops = 10_000 * actor_count;
+        std.debug.print("\n--- VCR Chaos Mutation Results ---\n", .{});
+        std.debug.print("Total Operations: {d}\n", .{total_ops});
+        std.debug.print("Elapsed Time:     {d:>12} ns\n", .{elapsed});
+        std.debug.print("Avg Per Action:   {d:>12} ns\n", .{elapsed / total_ops});
     }
 }
