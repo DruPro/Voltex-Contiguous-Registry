@@ -26,18 +26,26 @@ pub const DynamicCore = struct {
 
     /// Appends a new value to the end of the memory buffer.
     pub fn setField(self: *DynamicCore, field_name: []const u8, value: anytype, allocator: std.mem.Allocator) !void {
-        // 1. Check if the field already exists
-        if (self.fields.contains(field_name)) {
-            // If it exists, remove it.
-            // This triggers the SIMD relocation to close the gap.
+        // 1. Prepare the new data
+        const byteTransform = std.mem.toBytes(value);
+        const valTypeID = @typeName(@TypeOf(value));
+        // 2. Check if the field already exists
+        if (self.fields.getPtr(field_name)) |existing_field| {
+            // --- THE GOLDEN PATH: In-Place Update ---
+            if (existing_field.length == byteTransform.len) {
+                const start = existing_field.offset;
+                const end = start + existing_field.length;
+                @memcpy(self.memory.items[start..end], &byteTransform);
+                existing_field.typeID = valTypeID; // Update type if needed
+                return;
+            }
+
+            // If size changed, we have to do the expensive move
             self.removeField(field_name);
         }
 
-        // 2. Prepare the new data
-        const byteTransform = std.mem.toBytes(value);
         const byteLen: usize = byteTransform.len;
         const byteOffset: usize = self.memory.items.len;
-        const valTypeID = @typeName(@TypeOf(value));
 
         // 3. Append to the end of the memory buffer
         try self.memory.appendSlice(allocator, &byteTransform);
@@ -135,66 +143,73 @@ const CoreField = struct {
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
-    defer _ = gpa.deinit();
-
-    // 1. Initialize the Core
-    var myCore = try DynamicCore.init("Voltex_Engine", allocator);
-    defer myCore.deinit(allocator);
-
-    // 2. Define the State Function Type
-    // Returns the name of the next field to execute
-    const StateFn = *const fn (core: *DynamicCore, alloc: std.mem.Allocator) []const u8;
-
-    // 3. Register our Logic (Functions) and Data into the same buffer
-    try myCore.setField("init", @as(StateFn, initializeState), allocator);
-    try myCore.setField("work", @as(StateFn, workState), allocator);
-    try myCore.setField("exit", @as(StateFn, exitState), allocator);
-
-    // Initial Data
-    try myCore.setField("counter", @as(i32, 0), allocator);
-
-    // 4. The Stackless Trampoline Loop
-    var current_state_key: []const u8 = "init";
-
-    std.debug.print("--- Starting Voltex FSM ---\n", .{});
-
-    while (!std.mem.eql(u8, current_state_key, "end")) {
-        // Fetch the function pointer from the core
-        const func = try myCore.getField(current_state_key, StateFn);
-
-        // Execute and get the next state key
-        const next_key = func(&myCore, allocator);
-
-        std.debug.print("State Transition: {s} -> {s} (Buffer Len: {d})\n", .{ current_state_key, next_key, myCore.memory.items.len });
-
-        current_state_key = next_key;
+    // Use the GPA's check to ensure we cleaned up perfectly
+    defer {
+        const check = gpa.deinit();
+        if (check == .leak) @panic("Memory Leak Detected!");
     }
-}
 
-// --- State Logic Functions ---
+    const actor_count: usize = 1_000;
 
-fn initializeState(core: *DynamicCore, alloc: std.mem.Allocator) []const u8 {
-    _ = alloc;
-    _ = core;
-    std.debug.print("[INIT] Setting up resources...\n", .{});
-    return "work";
-}
+    // --- Setup: Create 1,000 Actors ---
+    var warehouse_actors = try allocator.alloc(std.StringHashMap(i32), actor_count);
+    var voltex_actors = try allocator.alloc(DynamicCore, actor_count);
 
-fn workState(core: *DynamicCore, alloc: std.mem.Allocator) []const u8 {
-    // Get counter, increment it, and set it back
-    // This triggers the SIMD removeField/setField relocation internally!
-    var count = core.getField("counter", i32) catch 0;
-    count += 1;
+    // Clean up individual actors at the end
+    defer {
+        for (warehouse_actors) |*map| map.deinit();
+        allocator.free(warehouse_actors);
 
-    std.debug.print("[WORK] Iteration {d}...\n", .{count});
-    core.setField("counter", count, alloc) catch unreachable;
+        for (voltex_actors) |*core| core.deinit(allocator);
+        allocator.free(voltex_actors);
+    }
 
-    return if (count < 3) "work" else "exit";
-}
+    for (0..actor_count) |i| {
+        // Warehouse setup
+        warehouse_actors[i] = std.StringHashMap(i32).init(allocator);
+        try warehouse_actors[i].ensureTotalCapacity(3); // Fixes the 'grow' crash
+        try warehouse_actors[i].put("hp", 100);
+        try warehouse_actors[i].put("x", @intCast(i));
+        try warehouse_actors[i].put("y", 20);
 
-fn exitState(core: *DynamicCore, alloc: std.mem.Allocator) []const u8 {
-    _ = alloc;
-    _ = core;
-    std.debug.print("[EXIT] Shutting down...\n", .{});
-    return "end";
+        // Voltex setup
+        voltex_actors[i] = try DynamicCore.init("Actor", allocator);
+        try voltex_actors[i].setField("hp", @as(i32, 100), allocator);
+        try voltex_actors[i].setField("x", @as(i32, @intCast(i)), allocator);
+        try voltex_actors[i].setField("y", @as(i32, 20), allocator);
+    }
+
+    // A giant buffer to simulate a "Save File" or "Network Packet"
+    var world_buffer = std.ArrayListUnmanaged(u8){};
+    try world_buffer.ensureTotalCapacity(allocator, 1024 * 1024);
+    defer world_buffer.deinit(allocator);
+
+    std.debug.print("--- Starting Serialization Benchmark ({d} Actors) ---\n", .{actor_count});
+
+    // --- Benchmark 1: Warehouse Serialization ---
+    {
+        var timer = try std.time.Timer.start();
+        for (warehouse_actors) |*map| {
+            var it = map.iterator();
+            while (it.next()) |entry| {
+                try world_buffer.appendSlice(allocator, entry.key_ptr.*);
+                try world_buffer.appendSlice(allocator, &std.mem.toBytes(entry.value_ptr.*));
+            }
+        }
+        const elapsed = timer.read();
+        std.debug.print("Warehouse (Manual Crawl): {d:>12} ns\n", .{elapsed});
+    }
+
+    world_buffer.clearRetainingCapacity();
+
+    // --- Benchmark 2: Voltex Tape Serialization ---
+    {
+        var timer = try std.time.Timer.start();
+        for (voltex_actors) |*core| {
+            // This is the "Zero-Effort" Bulk Blit
+            try world_buffer.appendSlice(allocator, core.memory.items);
+        }
+        const elapsed = timer.read();
+        std.debug.print("Voltex Tape (Bulk Blit):  {d:>12} ns\n", .{elapsed});
+    }
 }
