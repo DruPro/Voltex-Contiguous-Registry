@@ -83,5 +83,3 @@ VCR is designed for systems where **predictable latency** is more important than
 MIT License - Developed for the Voltex Engine.
 
 ---
-
-**Would you like me to generate a `build.zig` file that includes the necessary optimization flags to ensure the SIMD code is correctly vectorized by the compiler?**
