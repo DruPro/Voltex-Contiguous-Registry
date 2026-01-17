@@ -14,7 +14,9 @@ VCR solves this by enforcing **Deterministic Contiguity**. When a field is remov
 
 ### Core Innovations
 
-* **Branchless Relocation:** Offsets are recalculated using the Iverson Bracket identity: . This eliminates branch mispredictions and pipeline stalls.
+* **Branchless Relocation:** Offsets are recalculated using the Iverson Bracket identity: $$
+\text{NewOffset} = \text{CurrentOffset} - \left( \text{HoleSize} \times [\text{CurrentOffset} > \text{HoleStart}] \right)
+$$ . This eliminates branch mispredictions and pipeline stalls.
 * **Structure of Arrays (SoA) Metadata:** Metadata (offsets, lengths, and name hashes) are stored in parallel contiguous arrays. This allows for **Linear SIMD Probing**, scanning up to 8 field hashes per CPU cycle using 256-bit vector registers.
 * **Zero-Copy Serialization:** Because the entire state of an entity lives in a single contiguous `u8` slice, saving or transmitting the state is a raw memory "blit" ( complexity).
 
