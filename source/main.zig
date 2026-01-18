@@ -64,6 +64,11 @@ const CoreFieldMeta = struct {
 
         return null;
     }
+    // The "Fast" way for systems
+    pub fn getFieldByIndex(self: *const DynamicCore, index: usize, comptime T: type) T {
+        const offset = self.metaData.offset.items[index];
+        return std.mem.bytesToValue(T, self.memory.items[offset..][0..@sizeOf(T)]);
+    }
 };
 
 pub const DynamicCore = struct {
@@ -135,16 +140,7 @@ pub const DynamicCore = struct {
     /// Reconstructs the type from the byte buffer
     pub fn getField(self: *const DynamicCore, field_name: []const u8, comptime T: type) !T {
         const idx = self.metaData.findFieldIndex(field_name) orelse return error.FieldNotFound;
-
-        // 1. Verify Type (Safety First)
-        var target_type_hash: TypeID = undefined;
-        try hashHelpers.gen_hash(@typeName(T), &target_type_hash);
-
-        if (self.metaData.typeID.items[idx] != target_type_hash) {
-            return error.TypeMismatch;
-        }
-
-        // 2. Direct Indexing (Fast!)
+        // 1. Direct Indexing (Fast!)
         const offset = self.metaData.offset.items[idx];
         const length = self.metaData.length.items[idx];
         const bytes = self.memory.items[offset..][0..length];
