@@ -140,6 +140,24 @@ pub const DynamicCore = struct {
     /// Reconstructs the type from the byte buffer
     pub fn getField(self: *const DynamicCore, field_name: []const u8, comptime T: type) !T {
         const idx = self.metaData.findFieldIndex(field_name) orelse return error.FieldNotFound;
+
+        // 1. Generate the type ID at compile-time
+        // This hash is calculated by the compiler, not at runtime!
+        const expected_type_id = comptime std.hash.Wyhash.hash(0, @typeName(T));
+
+        // 2. Single integer comparison (Zero overhead safety)
+        if (self.metaData.typeID.items[idx] != expected_type_id) {
+            return error.TypeMismatch;
+        }
+        // 3. Direct Indexing (Fast!)
+        const offset = self.metaData.offset.items[idx];
+        const length = self.metaData.length.items[idx];
+        const bytes = self.memory.items[offset..][0..length];
+        return std.mem.bytesToValue(T, bytes[0..@sizeOf(T)]);
+    }
+
+    pub fn getFieldUnsafe(self: *const DynamicCore, field_name: []const u8, comptime T: type) !T {
+        const idx = self.metaData.findFieldIndex(field_name) orelse return error.FieldNotFound;
         // 1. Direct Indexing (Fast!)
         const offset = self.metaData.offset.items[idx];
         const length = self.metaData.length.items[idx];
