@@ -1,9 +1,8 @@
 const std = @import("std");
 const hashHelpers = @import("./hash_helpers.zig");
 const builtin = @import("builtin");
-const hashStringLen = std.crypto.hash.Blake3.digest_length;
-const CoreID = [hashStringLen]u8;
-const TypeID = [hashStringLen]u8;
+const CoreID = u64;
+const TypeID = u64;
 const FieldNameHash: type = u64;
 const ByteTranform: type = []u8;
 const FieldFetchErr = error{ invalidField, invalidType };
@@ -65,12 +64,6 @@ const CoreFieldMeta = struct {
 
         return null;
     }
-};
-
-const CoreField = struct {
-    offset: usize,
-    length: usize,
-    typeID: []const u8,
 };
 
 pub const DynamicCore = struct {
@@ -147,14 +140,13 @@ pub const DynamicCore = struct {
         var target_type_hash: TypeID = undefined;
         try hashHelpers.gen_hash(@typeName(T), &target_type_hash);
 
-        if (!std.mem.eql(u8, &self.metaData.typeID.items[idx], &target_type_hash)) {
+        if (self.metaData.typeID.items[idx] != target_type_hash) {
             return error.TypeMismatch;
         }
 
         // 2. Direct Indexing (Fast!)
         const offset = self.metaData.offset.items[idx];
         const length = self.metaData.length.items[idx];
-
         const bytes = self.memory.items[offset..][0..length];
         return std.mem.bytesToValue(T, bytes[0..@sizeOf(T)]);
     }
@@ -355,7 +347,7 @@ pub fn main() !void {
             var timer = try std.time.Timer.start();
             for (0..iterations) |_| {
                 for (voltex_actors) |*core| {
-                    _ = core.metaData.findFieldIndex("hp");
+                    _ = try core.getField("hp", i32);
                 }
             }
             const elapsed = timer.read();
@@ -394,5 +386,44 @@ pub fn main() !void {
         std.debug.print("Total Operations: {d}\n", .{total_ops});
         std.debug.print("Elapsed Time:     {d:>12} ns\n", .{elapsed});
         std.debug.print("Avg Per Action:   {d:>12} ns\n", .{elapsed / total_ops});
+    }
+    // --- Benchmark 5: The "Handle" Victory (VCR vs HashMap) ---
+    // This demonstrates the "Steel" path: Pre-resolved indices vs. String Hashing.
+    {
+        const iterations: usize = 10_000;
+
+        // 1. Pre-calculate Handles (The VCR "Baking" Step)
+        // In a real system, you do this once when the Actor is spawned.
+        const hp_handles = try allocator.alloc(usize, actor_count);
+        defer allocator.free(hp_handles);
+        for (voltex_actors, 0..) |*core, i| {
+            hp_handles[i] = core.metaData.findFieldIndex("hp") orelse 0;
+        }
+
+        // We use a sink buffer to ensure the compiler doesn't optimize the work away
+        var hp_sink: i32 = 0;
+
+        // --- THE HOT LOOP ---
+        var timer = try std.time.Timer.start();
+        for (0..iterations) |_| {
+            for (voltex_actors, 0..) |*core, j| {
+                // LIGHTNING PATH: Zero Hashing. Zero SIMD Probing.
+                // We go: Handle -> Metadata Array -> Memory Tape.
+                const handle = hp_handles[j];
+
+                // Direct SoA Access (This is what the reviewer missed)
+                const offset = core.metaData.offset.items[handle];
+                const length = core.metaData.length.items[handle];
+
+                const bytes = core.memory.items[offset .. offset + length];
+                hp_sink = std.mem.bytesToValue(i32, bytes[0..4]);
+            }
+        }
+        const elapsed = timer.read();
+
+        // Final guard to prevent dead-code elimination
+        std.mem.doNotOptimizeAway(hp_sink);
+
+        std.debug.print("VCR Handle Access (10M Lookups): {d:>12} ns\n", .{elapsed});
     }
 }
