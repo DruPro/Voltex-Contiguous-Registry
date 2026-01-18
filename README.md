@@ -28,10 +28,13 @@ Measured on 1,000 Actors with a total of 10,000,000 operations.
 
 ### Serialization & Search Efficiency
 
-| Operation | Warehouse (Manual Crawl) | Voltex Tape (Bulk Blit) | Performance Gain |
-| --- | --- | --- | --- |
-| **Serialization (1k Actors)** | 346,000 ns | 29,400 ns | **11.7x Faster** |
-| **Search (1M Lookups)** | 1,210,112,000 ns | 723,462,100 ns | **1.67x Faster** |
+```sh
+--- Starting Serialization Benchmark (1000 Actors) ---
+Warehouse (Manual Crawl):       212100 ns
+Voltex Tape (Bulk Blit):         23800 ns
+HashMap Search (1M Lookups):    869927500 ns
+Voltex SIMD Search (1M Lookups):    471030300 ns
+```
 
 ### VCR Chaos Mutation Results
 
