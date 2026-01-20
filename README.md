@@ -1,6 +1,6 @@
 # Voltex-Contiguous Registry (VCR)
 
-The Voltex-Contiguous Registry (VCR) is a high-performance, data-oriented memory management architecture. It treats memory as a deterministic "tape" rather than a fragmented warehouse, developed from first principles to maximize CPU cache utilization and eliminate pointer-chasing.
+The Voltex-Contiguous Registry (VCR) is a high-performance, frequency aware memory management architecture. A lightweight, schema-flexible state container optimized for high-frequency mutation and cheap serialization, without hash map overhead.
 
 > **Note on Project Maturity:** VCR is currently in its infancy (~400 lines). The architecture is bound to evolve as the development cycle iterates, but the core principles remain fixed on maximizing temporal locality and SIMD efficiency.
 
