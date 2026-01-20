@@ -76,5 +76,3 @@ const mask = @intFromBool(offsets_vec > hole_start_vec);
 offsets_vec -= (hole_size_vec * mask);
 
 ```
-
-**Would you like me to elaborate on the "Trampoline Loop" logic for state machines, or should we focus on refining the JSON-to-VCR bridge further?**
